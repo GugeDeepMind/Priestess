@@ -1,14 +1,29 @@
 import { spawn, ChildProcess } from 'child_process'
 import path from 'path'
+import fs from 'fs'
 import http from 'http'
 
 let pythonProcess: ChildProcess | null = null
 const BACKEND_PORT = 8000
 const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`
 
+function findBackendDir(): string {
+  // In development: backend/ is sibling to dist-electron/
+  const devPath = path.join(__dirname, '..', 'backend')
+  if (fs.existsSync(path.join(devPath, 'run.py'))) {
+    return devPath
+  }
+  // In production (packaged): backend/ is in resources/
+  const prodPath = path.join(process.resourcesPath, 'backend')
+  if (fs.existsSync(path.join(prodPath, 'run.py'))) {
+    return prodPath
+  }
+  // Fallback
+  return devPath
+}
+
 export function startPythonBackend(): Promise<void> {
   return new Promise(async (resolve, reject) => {
-    // Check if backend is already running (e.g., started manually for dev)
     const alreadyRunning = await checkBackendHealth()
     if (alreadyRunning) {
       console.log('Python backend already running, skipping spawn')
@@ -16,8 +31,9 @@ export function startPythonBackend(): Promise<void> {
       return
     }
 
-    const backendDir = path.join(__dirname, '..', 'backend')
+    const backendDir = findBackendDir()
     const runScript = path.join(backendDir, 'run.py')
+    console.log('Starting Python backend from:', backendDir)
 
     pythonProcess = spawn('python', [runScript], {
       cwd: backendDir,
@@ -35,7 +51,6 @@ export function startPythonBackend(): Promise<void> {
 
     pythonProcess.stderr?.on('data', (data: Buffer) => {
       const text = data.toString()
-      // uvicorn logs to stderr by default
       console.log('[Python]', text.trim())
       if (text.includes('Application startup complete')) {
         resolve()
@@ -52,7 +67,6 @@ export function startPythonBackend(): Promise<void> {
       pythonProcess = null
     })
 
-    // Timeout: if backend doesn't start in 15s, resolve anyway and retry later
     setTimeout(() => resolve(), 15000)
   })
 }

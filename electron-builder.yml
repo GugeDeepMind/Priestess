@@ -1,0 +1,38 @@
+appId: com.priestess.app
+productName: Priestess
+copyright: Copyright © 2026
+
+directories:
+  output: release
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!__pycache__/**"
+      - "!*.pyc"
+      - "!*.db"
+      - "!.env"
+      - "!data/**"
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: null
+  sign: electron/sign.js
+  signingHashAlgorithms: null
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  installerIcon: null
+  uninstallerIcon: null
