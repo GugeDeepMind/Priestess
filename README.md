@@ -108,7 +108,7 @@ After each response, a reviewer agent evaluates whether concepts were explained 
 ## Installation
 
 ### Option A: Download installer
-1. Download `Priestess Setup 0.1.0.exe` from [Releases](https://github.com/GugeDeepMind/Priestess/releases)
+1. Download `Priestess Setup 0.2.0.exe` from [Releases](https://github.com/GugeDeepMind/Priestess/releases)
 2. Install and launch
 3. Create `backend/.env` in the install directory (see Configuration below)
 4. Install Python dependencies:
