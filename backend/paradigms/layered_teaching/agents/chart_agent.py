@@ -17,6 +17,7 @@ CODE_GEN_PROMPT = """You are a Python matplotlib code generator.
 Given a description of a chart/diagram, generate ONLY executable Python code that creates it.
 
 Rules:
+- You may ONLY import matplotlib and numpy. Do NOT use scipy, pandas, seaborn, or any other library.
 - Import matplotlib.pyplot as plt and numpy as np at the top
 - Use plt.figure(figsize=(8, 5), dpi=100)
 - Use a clean light theme with warm tones: plt.style.use('seaborn-v0_8-whitegrid')
@@ -26,6 +27,7 @@ Rules:
 - Output ONLY Python code, no markdown fences, no explanation
 - Make the chart visually clear with labels, title, and legend where appropriate
 - Use warm colors that look good on light backgrounds (#6B4A3A, #7E9B85, #C4956A, #9B8AAD, #B5785A)
+- If a task seems to require scipy or other libraries, implement it manually with numpy.
 """
 
 

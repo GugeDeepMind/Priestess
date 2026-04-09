@@ -33,6 +33,9 @@ class SimpleChatParadigm(BaseParadigm):
         db,
         conversation_id: str,
         parent_id: str | None,
+        settings: dict | None = None,
+        attachments: list | None = None,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[dict]:
         user_msg = tree_engine.create_message(
             db=db,
@@ -45,7 +48,9 @@ class SimpleChatParadigm(BaseParadigm):
         ctx = tree_engine.get_context_dicts(db, user_msg.id)
 
         full_response = []
-        async for chunk in self.agent.stream_response(ctx):
+        async for chunk in self.agent.stream_response(
+            ctx, settings=settings, system_prompt_override=system_prompt,
+        ):
             full_response.append(chunk)
             yield {"type": "text", "content": chunk}
 

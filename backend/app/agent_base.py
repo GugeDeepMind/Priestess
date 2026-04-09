@@ -13,11 +13,27 @@ class BaseAgent:
     def __init__(self, provider: BaseProvider):
         self.provider = provider
 
-    async def respond(self, context: list[dict]) -> str:
-        return await self.provider.generate(context, self.system_prompt)
+    async def respond(self, context: list[dict], settings: dict | None = None,
+                      system_prompt_override: str | None = None) -> str:
+        prompt = self.system_prompt
+        ctx = list(context)
 
-    async def stream_response(self, context: list[dict]) -> AsyncIterator[str]:
-        async for chunk in self.provider.stream(context, self.system_prompt):
+        # If user provided custom [REDACTED], inject it as first user message instead of system role
+        if system_prompt_override:
+            ctx.insert(0, {"role": "user", "content": system_prompt_override})
+
+        return await self.provider.generate(ctx, prompt, settings=settings)
+
+    async def stream_response(self, context: list[dict], settings: dict | None = None,
+                               system_prompt_override: str | None = None) -> AsyncIterator[str]:
+        prompt = self.system_prompt
+        ctx = list(context)
+
+        # If user provided custom [REDACTED], inject it as first user message instead of system role
+        if system_prompt_override:
+            ctx.insert(0, {"role": "user", "content": system_prompt_override})
+
+        async for chunk in self.provider.stream(ctx, prompt, settings=settings):
             yield chunk
 
     def get_model_name(self) -> str:

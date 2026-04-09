@@ -1,10 +1,9 @@
-"""Layered Teaching Paradigm — full implementation with review + knowledge graph.
+"""Layered Teaching Paradigm — full implementation with streaming interleave.
 
 Agents:
-  - main_teacher (beginner/intermediate/advanced) — streams teaching content
+  - main_teacher — streams teaching content
   - chart — sync injection, generates matplotlib charts
   - project cluster — async background, builds runnable projects
-  - reviewer — parallel monitor, reviews teaching quality after response
 """
 
 import asyncio
@@ -17,41 +16,27 @@ from app.platform.tree_engine import TreeEngine
 from app.platform.stream_pipeline import StreamPipeline, StreamEvent
 from app.platform.content_injector import ContentInjector
 from app.providers.base import BaseProvider
-from app.services.knowledge_graph import KnowledgeGraph
-
-from paradigms.layered_teaching.agents.main_teacher import (
-    BeginnerAgent, IntermediateAgent, AdvancedAgent,
-)
+from paradigms.layered_teaching.agents.main_teacher import MainTeacherAgent
 from paradigms.layered_teaching.agents.chart_agent import ChartAgent
-from paradigms.layered_teaching.agents.reviewer_agent import ReviewerAgent
 from paradigms.layered_teaching.agents.project_cluster.cluster import ProjectCluster
 
 
 class LayeredTeachingParadigm(BaseParadigm):
     name = "layered_teaching"
-    description = "Multi-agent layered teaching with streaming interleave"
+    description = "Multi-agent teaching with streaming interleave"
     icon = ""
 
     def __init__(self, provider: BaseProvider):
         self.provider = provider
 
-        # Teaching agents at different levels
-        self.beginner = BeginnerAgent(provider)
-        self.intermediate = IntermediateAgent(provider)
-        self.advanced = AdvancedAgent(provider)
+        self.teacher = MainTeacherAgent(provider)
 
         # Helper agents
         self.chart = ChartAgent(provider)
-        self.reviewer = ReviewerAgent(provider)
         self.project_cluster = ProjectCluster(provider)
 
-        # Currently active teacher (default: beginner)
-        self.active_teacher = self.beginner
-
         self._agents = {
-            "beginner": self.beginner,
-            "intermediate": self.intermediate,
-            "advanced": self.advanced,
+            "main_teacher": self.teacher,
             "chart": self.chart,
         }
 
@@ -59,15 +44,7 @@ class LayeredTeachingParadigm(BaseParadigm):
         return self._agents
 
     def register_monitors(self) -> list[BaseAgent]:
-        return [self.reviewer]
-
-    def set_level(self, level: str):
-        level_map = {
-            "beginner": self.beginner,
-            "intermediate": self.intermediate,
-            "advanced": self.advanced,
-        }
-        self.active_teacher = level_map.get(level, self.beginner)
+        return []
 
     async def _handle_sync_call(self, agent_name: str,
                                 instruction: str) -> list[StreamEvent]:
@@ -128,6 +105,9 @@ class LayeredTeachingParadigm(BaseParadigm):
         db,
         conversation_id: str,
         parent_id: str | None,
+        settings: dict | None = None,
+        attachments: list | None = None,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[dict]:
         # Save user message
         user_msg = tree_engine.create_message(
@@ -141,10 +121,32 @@ class LayeredTeachingParadigm(BaseParadigm):
         # Build context from tree path
         ctx = tree_engine.get_context_dicts(db, user_msg.id)
 
-        # Prepend knowledge graph to context
-        kg = KnowledgeGraph("default")
-        kg_context = kg.to_context_string()
-        ctx_with_kg = [{"role": "system", "content": kg_context}] + ctx
+        # Knowledge graph disabled — pass context through directly
+        ctx_with_kg = list(ctx)
+
+        # If attachments present, convert last user message to multimodal format
+        if attachments:
+            import base64
+            for i in range(len(ctx_with_kg) - 1, -1, -1):
+                if ctx_with_kg[i].get("role") == "user":
+                    content_parts = [{"type": "text", "text": ctx_with_kg[i]["content"]}]
+                    for att in attachments:
+                        if att.get("type") == "image":
+                            content_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{att['media_type']};base64,{att['data']}"}
+                            })
+                        elif att.get("type") == "document":
+                            try:
+                                text = base64.b64decode(att["data"]).decode("utf-8", errors="replace")
+                                content_parts.append({
+                                    "type": "text",
+                                    "text": f"\n[Attached: {att.get('filename', 'file')}]\n{text}"
+                                })
+                            except Exception:
+                                pass
+                    ctx_with_kg[i]["content"] = content_parts
+                    break
 
         # Create stream pipeline
         pipeline = StreamPipeline(
@@ -155,12 +157,38 @@ class LayeredTeachingParadigm(BaseParadigm):
         # Stream from active teacher through the pipeline
         full_response_parts = []
         pending_images = []  # collect image data during stream, persist after assistant msg
-        raw_stream = self.active_teacher.stream_response(ctx_with_kg)
+        raw_stream = self.teacher.stream_response(
+            ctx_with_kg, settings=settings, system_prompt_override=system_prompt,
+        )
 
-        async for event in pipeline.process(raw_stream):
+        # Wrap stream to separate thinking markers from content
+        THINKING_MARKER = "\x00THINKING\x00"
+
+        async def filtered_stream():
+            async for chunk in raw_stream:
+                if THINKING_MARKER in chunk:
+                    # This chunk is thinking content — yield as-is (with marker)
+                    yield chunk
+                else:
+                    yield chunk
+
+        async for event in pipeline.process(filtered_stream()):
             if event.type == "text":
-                full_response_parts.append(event.content)
-                yield {"type": "text", "content": event.content}
+                # Check if text contains thinking markers
+                content = event.content
+                if THINKING_MARKER in content:
+                    parts = content.split(THINKING_MARKER)
+                    for i, part in enumerate(parts):
+                        if i == 0 and part:
+                            # Regular text before first marker
+                            full_response_parts.append(part)
+                            yield {"type": "text", "content": part}
+                        elif i > 0 and part:
+                            # Thinking content (after marker)
+                            yield {"type": "thinking", "content": part}
+                else:
+                    full_response_parts.append(content)
+                    yield {"type": "text", "content": content}
 
             elif event.type == "call_start":
                 yield {
@@ -186,11 +214,8 @@ class LayeredTeachingParadigm(BaseParadigm):
                     yield event.data
 
             elif event.type == "async_started":
-                yield {
-                    "type": "async_started",
-                    "agent_name": event.agent_name,
-                    "instruction": event.content,
-                }
+                # Async tasks run silently in background — don't report to frontend
+                pass
 
             elif event.type == "error":
                 yield {
@@ -207,8 +232,8 @@ class LayeredTeachingParadigm(BaseParadigm):
             role="assistant",
             content=full_text,
             parent_id=user_msg.id,
-            agent_name=self.active_teacher.name,
-            model_used=self.active_teacher.get_model_name(),
+            agent_name=self.teacher.name,
+            model_used=self.teacher.get_model_name(),
         )
 
         # Persist pending images as children of assistant message
@@ -233,16 +258,110 @@ class LayeredTeachingParadigm(BaseParadigm):
             "user_message_id": user_msg.id,
         }
 
-        # === Parallel monitor: Teaching Review ===
-        # Run reviewer AFTER the main response is done (non-blocking for the user)
-        if full_text and len(full_text) > 100:
+    async def on_regenerate(
+        self,
+        user_message_id: str,
+        tree_engine: TreeEngine,
+        db,
+        conversation_id: str,
+        settings: dict | None = None,
+        system_prompt: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Regenerate: create a new assistant response under the existing user message."""
+        # Build context from the existing user message (tree path up to it)
+        ctx = tree_engine.get_context_dicts(db, user_message_id)
+
+        # Create stream pipeline
+        pipeline = StreamPipeline(
+            call_handler=self._handle_sync_call,
+            async_call_handler=self._handle_async_call,
+        )
+
+        full_response_parts = []
+        pending_images = []
+        raw_stream = self.teacher.stream_response(
+            ctx, settings=settings, system_prompt_override=system_prompt,
+        )
+
+        THINKING_MARKER = "\x00THINKING\x00"
+
+        async def filtered_stream():
+            async for chunk in raw_stream:
+                yield chunk
+
+        async for event in pipeline.process(filtered_stream()):
+            if event.type == "text":
+                content = event.content
+                if THINKING_MARKER in content:
+                    parts = content.split(THINKING_MARKER)
+                    for i, part in enumerate(parts):
+                        if i == 0 and part:
+                            full_response_parts.append(part)
+                            yield {"type": "text", "content": part}
+                        elif i > 0 and part:
+                            yield {"type": "thinking", "content": part}
+                else:
+                    full_response_parts.append(content)
+                    yield {"type": "text", "content": content}
+
+            elif event.type == "call_start":
+                yield {
+                    "type": "call_start",
+                    "agent_name": event.agent_name,
+                    "call_type": event.call_type,
+                    "instruction": event.content,
+                }
+
+            elif event.type == "call_result":
+                if event.data.get("type") == "image":
+                    pending_images.append({
+                        "data": event.data.get("data", ""),
+                        "format": event.data.get("format", "png"),
+                        "caption": event.data.get("caption", ""),
+                    })
+                    yield event.data
+                else:
+                    text_content = event.data.get("content", event.content or "")
+                    if text_content:
+                        full_response_parts.append(text_content)
+                    yield event.data
+
+            elif event.type == "error":
+                yield {
+                    "type": "error",
+                    "agent_name": event.agent_name,
+                    "content": event.content,
+                }
+
+        # Save new assistant message as child of the existing user message
+        full_text = "".join(full_response_parts)
+        assistant_msg = tree_engine.create_message(
+            db=db,
+            conversation_id=conversation_id,
+            role="assistant",
+            content=full_text,
+            parent_id=user_message_id,
+            agent_name=self.teacher.name,
+            model_used=self.teacher.get_model_name(),
+        )
+
+        import json as json_mod
+        for img in pending_images:
             try:
-                review_marks = await self.reviewer.review(full_text)
-                if review_marks:
-                    yield {
-                        "type": "ui",
-                        "component": "ReviewMarks",
-                        "props": {"marks": review_marks},
-                    }
-            except Exception as e:
-                print(f"[Reviewer Error] {e}")
+                tree_engine.create_message(
+                    db=db,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=json_mod.dumps(img),
+                    parent_id=assistant_msg.id,
+                    agent_name="chart",
+                    content_type="image",
+                )
+            except Exception:
+                pass
+
+        yield {
+            "type": "done",
+            "message_id": assistant_msg.id,
+            "user_message_id": user_message_id,
+        }

@@ -1,4 +1,4 @@
-import type { Conversation, StreamEvent, Paradigm } from '../types'
+import type { Conversation, StreamEvent, Paradigm, ChatSettings, AttachmentPayload } from '../types'
 
 const BASE_URL = 'http://127.0.0.1:8000'
 
@@ -47,11 +47,60 @@ export async function* streamChat(
   conversationId: string,
   content: string,
   parentId?: string | null,
+  settings?: ChatSettings | null,
+  attachments?: AttachmentPayload[] | null,
+  systemPrompt?: string | null,
 ): AsyncGenerator<StreamEvent> {
+  const body: Record<string, unknown> = { content, parent_id: parentId }
+  if (settings) body.settings = settings
+  if (attachments && attachments.length > 0) body.attachments = attachments
+  if (systemPrompt) body.system_prompt = systemPrompt
+
   const res = await fetch(`${BASE_URL}/api/chat/${conversationId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content, parent_id: parentId }),
+    body: JSON.stringify(body),
+  })
+
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        try {
+          const event: StreamEvent = JSON.parse(line.slice(6))
+          yield event
+        } catch {
+          // skip malformed events
+        }
+      }
+    }
+  }
+}
+
+export async function* regenerateChat(
+  conversationId: string,
+  messageId: string,
+  settings?: ChatSettings | null,
+  systemPrompt?: string | null,
+): AsyncGenerator<StreamEvent> {
+  const body: Record<string, unknown> = {}
+  if (settings) body.settings = settings
+  if (systemPrompt) body.system_prompt = systemPrompt
+
+  const res = await fetch(`${BASE_URL}/api/chat/${conversationId}/regenerate/${messageId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   })
 
   const reader = res.body!.getReader()

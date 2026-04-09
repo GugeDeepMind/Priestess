@@ -42,9 +42,25 @@ def _get_paradigm(paradigm_name: str = "layered_teaching"):
     return paradigm_class(provider=_get_provider())
 
 
+class ChatSettings(BaseModel):
+    temperature: float | None = None
+    max_tokens: int | None = None
+    thinking: str | None = None  # "none", "low", "medium", "high"
+
+
+class Attachment(BaseModel):
+    type: str          # "image" | "document"
+    media_type: str    # "image/png", "text/plain", etc.
+    data: str          # base64 encoded
+    filename: str | None = None
+
+
 class ChatMessage(BaseModel):
     content: str
     parent_id: str | None = None
+    settings: ChatSettings | None = None
+    attachments: list[Attachment] | None = None
+    system_prompt: str | None = None
 
 
 @router.post("/chat/{conversation_id}")
@@ -56,6 +72,16 @@ async def send_message(conversation_id: str, body: ChatMessage,
     paradigm = _get_paradigm(paradigm_name)
 
     async def event_stream():
+        # Build settings dict for providers
+        gen_settings = None
+        if body.settings:
+            gen_settings = body.settings.model_dump(exclude_none=True) or None
+
+        # Build attachments list
+        att_list = None
+        if body.attachments:
+            att_list = [a.model_dump() for a in body.attachments]
+
         async for event in paradigm.on_user_message(
             user_content=body.content,
             context=[],
@@ -63,23 +89,45 @@ async def send_message(conversation_id: str, body: ChatMessage,
             db=db,
             conversation_id=conversation_id,
             parent_id=body.parent_id,
+            settings=gen_settings,
+            attachments=att_list,
+            system_prompt=body.system_prompt,
         ):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-@router.post("/chat/{conversation_id}/branch/{message_id}")
-def create_branch(conversation_id: str, message_id: str, body: ChatMessage,
-                  db: Session = Depends(get_db)):
-    msg = tree_engine.create_branch(
-        db=db,
-        parent_message_id=message_id,
-        conversation_id=conversation_id,
-        role="user",
-        content=body.content,
-    )
-    return {"id": msg.id, "parent_id": msg.parent_id, "content": msg.content}
+class RegenerateBody(BaseModel):
+    settings: ChatSettings | None = None
+    system_prompt: str | None = None
+
+
+@router.post("/chat/{conversation_id}/regenerate/{message_id}")
+async def regenerate_message(conversation_id: str, message_id: str,
+                             body: RegenerateBody | None = None,
+                             db: Session = Depends(get_db)):
+    """Regenerate: create a new assistant response under an existing user message."""
+    conv = db.query(Conversation).get(conversation_id)
+    paradigm_name = conv.paradigm if conv else "layered_teaching"
+    paradigm = _get_paradigm(paradigm_name)
+
+    async def event_stream():
+        gen_settings = None
+        if body and body.settings:
+            gen_settings = body.settings.model_dump(exclude_none=True) or None
+
+        async for event in paradigm.on_regenerate(
+            user_message_id=message_id,
+            tree_engine=tree_engine,
+            db=db,
+            conversation_id=conversation_id,
+            settings=gen_settings,
+            system_prompt=body.system_prompt if body else None,
+        ):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/chat/{conversation_id}/tree")

@@ -38,6 +38,9 @@ class BaseParadigm(ABC):
         db,
         conversation_id: str,
         parent_id: str | None,
+        settings: dict | None = None,
+        attachments: list | None = None,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[dict]:
         """Handle a user message and yield stream events.
 
@@ -53,3 +56,18 @@ class BaseParadigm(ABC):
         Override to request specific UI components.
         """
         return {"components": []}
+
+    async def on_regenerate(
+        self,
+        user_message_id: str,
+        tree_engine: TreeEngine,
+        db,
+        conversation_id: str,
+        settings: dict | None = None,
+        system_prompt: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Regenerate: produce a new assistant response under an existing user message.
+
+        Default implementation raises NotImplementedError — paradigms should override.
+        """
+        raise NotImplementedError("Paradigm does not support regeneration")

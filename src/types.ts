@@ -17,7 +17,7 @@ export interface Conversation {
 
 export interface StreamEvent {
   type: 'text' | 'call_start' | 'call_result' | 'async_started' | 'error' | 'done'
-  | 'image' | 'ui' | 'code'
+  | 'image' | 'ui' | 'code' | 'thinking'
   content?: string
   agent_name?: string
   call_type?: string
@@ -35,4 +35,23 @@ export interface Paradigm {
   name: string
   description: string
   icon: string
+}
+
+export interface ChatSettings {
+  temperature: number
+  max_tokens: number
+  thinking: 'none' | 'low' | 'medium' | 'high'
+}
+
+export interface AttachedFile {
+  file: File
+  preview?: string   // data URL for image preview
+  type: 'image' | 'document'
+}
+
+export interface AttachmentPayload {
+  type: 'image' | 'document'
+  media_type: string
+  data: string       // base64
+  filename: string
 }

@@ -3,9 +3,11 @@ import { MessageBubble, AgentCallBubble } from '../components/MessageBubble'
 import { StreamRenderer } from '../components/StreamRenderer'
 import { ReviewMarks } from '../components/ReviewMark'
 import { BranchTreePanel } from '../components/BranchTree'
-import { createConversation, streamChat, listConversations, getConversationTree, deleteConversation, renameConversation } from '../services/api'
-import type { Conversation, StreamEvent } from '../types'
-import { Send, Plus, MessageSquare, ArrowLeft, BookOpen, GitFork, ChevronLeft, ChevronRight, GitBranch, Pencil, Trash2, Check, X } from 'lucide-react'
+import { SettingsPopover } from '../components/SettingsPopover'
+import { SystemPromptEditor } from '../components/SystemPromptEditor'
+import { createConversation, streamChat, regenerateChat, listConversations, getConversationTree, deleteConversation, renameConversation } from '../services/api'
+import type { Conversation, StreamEvent, ChatSettings, AttachedFile, AttachmentPayload } from '../types'
+import { Send, Plus, MessageSquare, ArrowLeft, BookOpen, GitFork, ChevronLeft, ChevronRight, GitBranch, Pencil, Trash2, Check, X, Paperclip, SlidersHorizontal, FileText, RotateCcw, PenLine } from 'lucide-react'
 
 interface InlineContent {
   type: 'text' | 'image' | 'ui'
@@ -34,11 +36,26 @@ interface DisplayMessage {
   agentCalls?: { agentName: string; callType: string; instruction: string; result?: string }[]
   inlineContent?: InlineContent[]
   reviewMarks?: any[]
+  thinkingContent?: string
   // Branch info
   siblingCount?: number   // how many siblings at this level
   siblingIndex?: number   // which sibling we're showing (0-based)
   hasMultipleBranches?: boolean
   parentId?: string       // for branch switching
+}
+
+function ThinkingBlock({ content, defaultOpen = false }: { content: string; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="thinking-block">
+      <button className="thinking-toggle" onClick={() => setOpen(v => !v)}>
+        <span className="thinking-icon">{open ? '▼' : '▶'}</span>
+        <span>思考过程</span>
+        <span className="thinking-length">{content.length} 字</span>
+      </button>
+      {open && <div className="thinking-content">{content}</div>}
+    </div>
+  )
 }
 
 interface ChatProps {
@@ -54,16 +71,55 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
   const [input, setInput] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamingText, setStreamingText] = useState('')
+  const [streamingThinking, setStreamingThinking] = useState('')
   const [streamingInline, setStreamingInline] = useState<InlineContent[]>([])
   const [lastMessageId, setLastMessageId] = useState<string | null>(null)
   const [forkFromId, setForkFromId] = useState<string | null>(null) // which message to fork from
+  const forkFromIdRef = useRef<string | null>(null)
+  useEffect(() => { forkFromIdRef.current = forkFromId }, [forkFromId])
   const [treeData, setTreeData] = useState<{ roots: TreeNode[] } | null>(null)
   const [branchChoices, setBranchChoices] = useState<Record<string, number>>({}) // parentId -> childIndex
+  const branchChoicesRef = useRef<Record<string, number>>({})
+  useEffect(() => { branchChoicesRef.current = branchChoices }, [branchChoices])
   const [showTreePanel, setShowTreePanel] = useState(false)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  // Settings & upload state — persisted to localStorage
+  const [temperature, setTemperature] = useState(() => {
+    const v = localStorage.getItem('priestess_temperature')
+    return v !== null ? parseFloat(v) : 1.0
+  })
+  const [maxTokens, setMaxTokens] = useState(() => {
+    const v = localStorage.getItem('priestess_maxTokens')
+    return v !== null ? parseInt(v) : 4096
+  })
+  const [thinkingIntensity, setThinkingIntensity] = useState<'none' | 'low' | 'medium' | 'high'>(() => {
+    return (localStorage.getItem('priestess_thinking') as any) || 'none'
+  })
+  const [showSettings, setShowSettings] = useState(false)
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([])
+  const [showPromptEditor, setShowPromptEditor] = useState(false)
+  const [customSystemPrompt, setCustomSystemPrompt] = useState<string | null>(() => {
+    return localStorage.getItem('priestess_systemPrompt')
+  })
+  const [agentName, setAgentName] = useState(() => {
+    return localStorage.getItem('priestess_agentName') || '学习助手'
+  })
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null)
+  const [editingContent, setEditingContent] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Persist settings to localStorage
+  useEffect(() => { localStorage.setItem('priestess_temperature', String(temperature)) }, [temperature])
+  useEffect(() => { localStorage.setItem('priestess_maxTokens', String(maxTokens)) }, [maxTokens])
+  useEffect(() => { localStorage.setItem('priestess_thinking', thinkingIntensity) }, [thinkingIntensity])
+  useEffect(() => {
+    if (customSystemPrompt) localStorage.setItem('priestess_systemPrompt', customSystemPrompt)
+    else localStorage.removeItem('priestess_systemPrompt')
+  }, [customSystemPrompt])
+  useEffect(() => { localStorage.setItem('priestess_agentName', agentName) }, [agentName])
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -112,7 +168,7 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
 
       if (regularNodes.length === 0) return
 
-      const choiceIdx = parentId ? (choices[parentId] ?? 0) : 0
+      const choiceIdx = parentId ? (choices[parentId] ?? regularNodes.length - 1) : 0
       const idx = Math.min(choiceIdx, regularNodes.length - 1)
       const node = regularNodes[idx]
 
@@ -142,7 +198,7 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
     try {
       const tree = await getConversationTree(convId)
       setTreeData(tree)
-      const choices = branchChoices
+      const choices = branchChoicesRef.current
       const flat = buildPathFromTree(tree, choices)
       setMessages(flat)
       setLastMessageId(flat.length > 0 ? flat[flat.length - 1].id : null)
@@ -151,7 +207,7 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
       setLastMessageId(null)
       setTreeData(null)
     }
-  }, [branchChoices, buildPathFromTree])
+  }, [buildPathFromTree])
 
   const handleDeleteConversation = async (convId: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -194,12 +250,15 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
     setTreeData(null)
     setBranchChoices({})
     setForkFromId(null)
+    forkFromIdRef.current = null
   }
 
   const handleSelectConversation = async (convId: string) => {
+    if (convId === activeConv) return  // already active — don't reset branch state
     setActiveConv(convId)
     setBranchChoices({})
     setForkFromId(null)
+    forkFromIdRef.current = null
     await loadConversation(convId)
   }
 
@@ -223,36 +282,168 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
 
   const handleFork = (messageId: string) => {
     setForkFromId(messageId)
+    forkFromIdRef.current = messageId
     inputRef.current?.focus()
   }
 
   const handleCancelFork = () => {
     setForkFromId(null)
+    forkFromIdRef.current = null
   }
 
-  const handleTreeNodeSelect = (nodeId: string) => {
-    if (!treeData) return
-    // Find the path from root to this node and set branch choices
-    const newChoices: Record<string, number> = {}
+  // Find branch choices that navigate from root to a specific node
+  const findPathChoices = useCallback((tree: { roots: TreeNode[] }, targetId: string): Record<string, number> | null => {
+    const choices: Record<string, number> = {}
 
     const findPath = (nodes: TreeNode[], parentId?: string): boolean => {
       const regularNodes = nodes.filter(n => n.content_type !== 'image')
       for (let i = 0; i < regularNodes.length; i++) {
         const node = regularNodes[i]
-        if (parentId) newChoices[parentId] = i
-        if (node.id === nodeId) return true
+        if (parentId) choices[parentId] = i
+        if (node.id === targetId) return true
         if (node.children?.length && findPath(node.children, node.id)) return true
       }
-      if (parentId) delete newChoices[parentId]
+      if (parentId) delete choices[parentId]
       return false
     }
 
-    if (findPath(treeData.roots)) {
+    return findPath(tree.roots) ? choices : null
+  }, [])
+
+  const handleTreeNodeSelect = (nodeId: string) => {
+    if (!treeData) return
+    const newChoices = findPathChoices(treeData, nodeId)
+    if (newChoices) {
       setBranchChoices(newChoices)
       const flat = buildPathFromTree(treeData, newChoices)
       setMessages(flat)
       setLastMessageId(flat.length > 0 ? flat[flat.length - 1].id : null)
     }
+  }
+
+  // --- File handling helpers ---
+  function fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result as string
+        // Strip data URL prefix "data:...;base64,"
+        resolve(result.split(',')[1])
+      }
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    const newAttached: AttachedFile[] = files.map(file => {
+      const isImage = file.type.startsWith('image/')
+      return { file, type: isImage ? 'image' : 'document' } as AttachedFile
+    })
+    // Generate previews for images
+    newAttached.forEach(af => {
+      if (af.type === 'image') {
+        const reader = new FileReader()
+        reader.onload = () => {
+          af.preview = reader.result as string
+          setAttachedFiles(prev => [...prev])  // trigger re-render
+        }
+        reader.readAsDataURL(af.file)
+      }
+    })
+    setAttachedFiles(prev => [...prev, ...newAttached])
+    // Reset file input so same file can be re-selected
+    e.target.value = ''
+  }
+
+  // --- Retry: regenerate assistant response under the same user message ---
+  const handleRetry = async (msg: DisplayMessage) => {
+    if (isStreaming || !activeConv || msg.role !== 'user' || !msg.id || msg.id.startsWith('temp-')) return
+
+    setIsStreaming(true)
+    setStreamingText('')
+    setStreamingThinking('')
+    setStreamingInline([])
+
+    const settings: ChatSettings = { temperature, max_tokens: maxTokens, thinking: thinkingIntensity }
+    const agentCalls: DisplayMessage['agentCalls'] = []
+    const inlineContent: InlineContent[] = []
+
+    try {
+      let fullText = ''
+      let fullThinking = ''
+      let doneMessageId: string | null = null
+      for await (const event of regenerateChat(activeConv, msg.id, settings, customSystemPrompt)) {
+        switch (event.type) {
+          case 'thinking': fullThinking += event.content || ''; setStreamingThinking(fullThinking); break
+          case 'text': fullText += event.content || ''; setStreamingText(fullText); break
+          case 'call_start': agentCalls.push({ agentName: event.agent_name || '', callType: event.call_type || 'sync', instruction: event.instruction || event.content || '' }); break
+          case 'call_result': fullText += event.content || ''; setStreamingText(fullText); if (agentCalls.length > 0) agentCalls[agentCalls.length - 1].result = event.content; break
+          case 'image': inlineContent.push({ type: 'image', imageData: event.data, imageFormat: event.format || 'png', caption: event.caption || '' }); setStreamingInline([...inlineContent]); break
+          case 'error': fullText += `\n[Error: ${event.content}]`; setStreamingText(fullText); break
+          case 'done': doneMessageId = event.message_id || null; setLastMessageId(event.message_id || null); break
+        }
+      }
+
+      // Reload tree and navigate to the new assistant message
+      const tree = await getConversationTree(activeConv)
+      setTreeData(tree)
+      const pathChoices = doneMessageId ? findPathChoices(tree, doneMessageId) : null
+      if (pathChoices) {
+        setBranchChoices(pathChoices)
+        const flat = buildPathFromTree(tree, pathChoices)
+        setMessages(flat)
+        setLastMessageId(flat.length > 0 ? flat[flat.length - 1].id : null)
+      } else {
+        setBranchChoices(prev => {
+          const updated = { ...prev, [msg.id]: 999 }
+          const flat = buildPathFromTree(tree, updated)
+          setMessages(flat)
+          setLastMessageId(flat.length > 0 ? flat[flat.length - 1].id : null)
+          return updated
+        })
+      }
+    } catch (err) {
+      console.error('Regenerate error:', err)
+    } finally {
+      setIsStreaming(false)
+      setStreamingText('')
+      setStreamingThinking('')
+      setStreamingInline([])
+    }
+  }
+
+  // --- Edit: edit user message then resend as new branch ---
+  const handleStartEdit = (msg: DisplayMessage) => {
+    setEditingMsgId(msg.id)
+    setEditingContent(msg.content)
+  }
+
+  const handleCancelEdit = () => {
+    setEditingMsgId(null)
+    setEditingContent('')
+  }
+
+  const handleConfirmEdit = (msg: DisplayMessage) => {
+    const newContent = editingContent.trim()
+    setEditingMsgId(null)
+    setEditingContent('')
+    if (!newContent || newContent === msg.content || !msg.parentId) return
+    // Resend with edited content by forking from the parent
+    handleRetryWithContent(msg.parentId, newContent)
+  }
+
+  const handleRetryWithContent = (forkParentId: string, content: string) => {
+    if (isStreaming) return
+    forkFromIdRef.current = forkParentId
+    setForkFromId(forkParentId)
+    setInput(content)
+    setTimeout(() => {
+      // Trigger handleSend programmatically
+      const btn = document.querySelector('.send-btn') as HTMLButtonElement
+      if (btn) btn.click()
+    }, 50)
   }
 
   const handleSend = async () => {
@@ -268,7 +459,25 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
     }
 
     // Determine parent: fork target or last message in current path
-    const parentId = forkFromId || lastMessageId
+    // Read from state (captured in closure) with ref as fallback for programmatic sends
+    const currentForkId = forkFromId ?? forkFromIdRef.current
+    const parentId = currentForkId || lastMessageId
+    console.log('[handleSend] forkFromId:', currentForkId, 'lastMessageId:', lastMessageId, '=> parentId:', parentId)
+
+    // Prepare attachments as base64 payloads
+    const attachmentPayloads: AttachmentPayload[] = []
+    for (const af of attachedFiles) {
+      const base64 = await fileToBase64(af.file)
+      attachmentPayloads.push({
+        type: af.type,
+        media_type: af.file.type || 'application/octet-stream',
+        data: base64,
+        filename: af.file.name,
+      })
+    }
+
+    // Build settings
+    const settings: ChatSettings = { temperature, max_tokens: maxTokens, thinking: thinkingIntensity }
 
     // Add user message — if forking, truncate to fork point first
     const userMsg: DisplayMessage = {
@@ -276,10 +485,10 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
       role: 'user',
       content,
     }
-    if (forkFromId) {
+    if (currentForkId) {
       // Truncate messages up to and including the fork-from message
       setMessages(prev => {
-        const forkIdx = prev.findIndex(m => m.id === forkFromId)
+        const forkIdx = prev.findIndex(m => m.id === currentForkId)
         if (forkIdx >= 0) {
           return [...prev.slice(0, forkIdx + 1), userMsg]
         }
@@ -289,9 +498,12 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
       setMessages(prev => [...prev, userMsg])
     }
     setInput('')
+    setAttachedFiles([])
     setForkFromId(null)
+    forkFromIdRef.current = null
     setIsStreaming(true)
     setStreamingText('')
+    setStreamingThinking('')
     setStreamingInline([])
 
     const agentCalls: DisplayMessage['agentCalls'] = []
@@ -300,8 +512,18 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
 
     try {
       let fullText = ''
-      for await (const event of streamChat(convId, content, parentId)) {
+      let fullThinking = ''
+      let doneMessageId: string | null = null
+      for await (const event of streamChat(
+        convId, content, parentId, settings,
+        attachmentPayloads.length > 0 ? attachmentPayloads : null,
+        customSystemPrompt,
+      )) {
         switch (event.type) {
+          case 'thinking':
+            fullThinking += event.content || ''
+            setStreamingThinking(fullThinking)
+            break
           case 'text':
             fullText += event.content || ''
             setStreamingText(fullText)
@@ -346,6 +568,7 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
             }
             break
           case 'done':
+            doneMessageId = event.message_id || null
             setLastMessageId(event.message_id || null)
             break
         }
@@ -359,22 +582,34 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
         agentCalls: agentCalls.length > 0 ? agentCalls : undefined,
         inlineContent: inlineContent.length > 0 ? inlineContent : undefined,
         reviewMarks: reviewMarksCollected.length > 0 ? reviewMarksCollected : undefined,
+        thinkingContent: fullThinking || undefined,
       }
       setMessages(prev => [...prev, assistantMsg])
 
-      // Reload tree and rebuild path
+      // Reload tree and navigate to the new message
       if (convId) {
         const tree = await getConversationTree(convId)
         setTreeData(tree)
 
-        // Rebuild messages from tree, selecting the newest branch at fork point
-        setBranchChoices(prev => {
-          const updated = parentId ? { ...prev, [parentId]: 999 } : { ...prev }
-          const flat = buildPathFromTree(tree, updated)
+        // Use DFS to find exact path to new assistant message, ensuring all
+        // ancestor fork points are set correctly (not just the immediate parent)
+        const targetId = doneMessageId
+        const pathChoices = targetId ? findPathChoices(tree, targetId) : null
+        if (pathChoices) {
+          setBranchChoices(pathChoices)
+          const flat = buildPathFromTree(tree, pathChoices)
           setMessages(flat)
           setLastMessageId(flat.length > 0 ? flat[flat.length - 1].id : null)
-          return updated
-        })
+        } else {
+          // Fallback: select newest branch at fork point
+          setBranchChoices(prev => {
+            const updated = parentId ? { ...prev, [parentId]: 999 } : { ...prev }
+            const flat = buildPathFromTree(tree, updated)
+            setMessages(flat)
+            setLastMessageId(flat.length > 0 ? flat[flat.length - 1].id : null)
+            return updated
+          })
+        }
       }
     } catch (err) {
       console.error('Stream error:', err)
@@ -498,25 +733,49 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
               )}
 
               <div className={`message-wrapper ${forkFromId === msg.id ? 'fork-target' : ''}`}>
-                <MessageBubble
-                  role={msg.role}
-                  content={msg.role === 'assistant' ? '' : msg.content}
-                  agentName={msg.agentName}
-                >
-                  {msg.role === 'assistant' && (
-                    <StreamRenderer text={msg.content} isStreaming={false} />
-                  )}
-                </MessageBubble>
-
-                {/* Fork button */}
-                {!isStreaming && msg.id && !msg.id.startsWith('temp-') && (
-                  <button
-                    className="fork-btn"
-                    onClick={() => forkFromId === msg.id ? handleCancelFork() : handleFork(msg.id)}
-                    title={forkFromId === msg.id ? "Cancel fork" : "Branch from here"}
+                {/* Edit mode for user messages */}
+                {msg.role === 'user' && editingMsgId === msg.id ? (
+                  <div className="message user editing">
+                    <textarea
+                      className="edit-textarea"
+                      value={editingContent}
+                      onChange={e => setEditingContent(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleConfirmEdit(msg) }
+                        if (e.key === 'Escape') handleCancelEdit()
+                      }}
+                      autoFocus
+                    />
+                    <div className="edit-actions">
+                      <button className="edit-action-btn cancel" onClick={handleCancelEdit}>取消</button>
+                      <button className="edit-action-btn confirm" onClick={() => handleConfirmEdit(msg)}>提交</button>
+                    </div>
+                  </div>
+                ) : (
+                  <MessageBubble
+                    role={msg.role}
+                    content={msg.role === 'assistant' ? '' : msg.content}
+                    agentName={msg.agentName}
                   >
-                    <GitFork size={14} />
-                  </button>
+                    {msg.role === 'assistant' && (
+                      <>
+                        {msg.thinkingContent && <ThinkingBlock content={msg.thinkingContent} />}
+                        <StreamRenderer text={msg.content} isStreaming={false} />
+                      </>
+                    )}
+                  </MessageBubble>
+                )}
+
+                {/* User message actions: retry & edit */}
+                {!isStreaming && msg.role === 'user' && msg.id && !msg.id.startsWith('temp-') && editingMsgId !== msg.id && (
+                  <div className="user-msg-actions">
+                    <button className="user-action-btn" title="重新生成" onClick={() => handleRetry(msg)}>
+                      <RotateCcw size={14} />
+                    </button>
+                    <button className="user-action-btn" title="编辑" onClick={() => handleStartEdit(msg)}>
+                      <PenLine size={14} />
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -535,6 +794,18 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
                 ) : null
               ))}
               {msg.reviewMarks && <ReviewMarks marks={msg.reviewMarks} />}
+
+              {/* Fork button — after all assistant content */}
+              {!isStreaming && msg.role === 'assistant' && msg.id && !msg.id.startsWith('temp-') && (
+                <button
+                  className={`fork-btn${forkFromId === msg.id ? ' fork-active' : ''}`}
+                  onClick={() => forkFromId === msg.id ? handleCancelFork() : handleFork(msg.id)}
+                  title={forkFromId === msg.id ? "取消分支" : "从此处创建分支"}
+                >
+                  <GitFork size={14} />
+                  <span className="fork-btn-label">{forkFromId === msg.id ? '取消分支' : '创建分支'}</span>
+                </button>
+              )}
             </React.Fragment>
           ))}
 
@@ -542,6 +813,7 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
           {isStreaming && (
             <>
               <MessageBubble role="assistant" content="" agentName="teacher" isStreaming>
+                {streamingThinking && <ThinkingBlock content={streamingThinking} defaultOpen={true} />}
                 <StreamRenderer text={streamingText} isStreaming={true} />
               </MessageBubble>
               {streamingInline.map((ic, i) => (
@@ -570,19 +842,86 @@ export function Chat({ paradigm, onBack, onOpenKnowledgeGraph }: ChatProps) {
             </div>
           )}
           <div className="input-row">
-            <input
+            <textarea
               ref={inputRef}
-              type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) handleSend() }}
-              placeholder={forkFromId ? "Type to create a new branch..." : activeConv ? "Type a message..." : "Start a new conversation..."}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
+              placeholder={forkFromId ? "输入内容创建新分支..." : activeConv ? "输入消息..." : "开始新对话..."}
               disabled={isStreaming}
+              rows={1}
+              onInput={e => {
+                const t = e.target as HTMLTextAreaElement
+                t.style.height = 'auto'
+                t.style.height = Math.min(t.scrollHeight, 150) + 'px'
+              }}
             />
             <button className="send-btn" onClick={handleSend} disabled={isStreaming || !input.trim()}>
               <Send size={18} />
             </button>
           </div>
+          {attachedFiles.length > 0 && (
+            <div className="file-preview-row">
+              {attachedFiles.map((af, i) => (
+                <div key={i} className="file-chip">
+                  {af.preview ? (
+                    <img src={af.preview} alt={af.file.name} className="file-chip-thumb" />
+                  ) : (
+                    <FileText size={14} />
+                  )}
+                  <span className="file-chip-name">{af.file.name}</span>
+                  <button className="file-chip-remove" onClick={() => setAttachedFiles(prev => prev.filter((_, j) => j !== i))}>
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="input-toolbar">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept="image/*,.pdf,.txt,.md,.csv"
+              style={{ display: 'none' }}
+              onChange={handleFileSelect}
+            />
+            <button className="toolbar-btn" title="上传文件" onClick={() => fileInputRef.current?.click()}>
+              <Paperclip size={16} />
+            </button>
+            <div className="toolbar-settings-wrapper">
+              <button className="toolbar-btn" title="模型设置" onClick={() => setShowSettings(v => !v)}>
+                <SlidersHorizontal size={16} />
+              </button>
+              {showSettings && (
+                <SettingsPopover
+                  temperature={temperature}
+                  maxTokens={maxTokens}
+                  thinking={thinkingIntensity}
+                  onTemperatureChange={setTemperature}
+                  onMaxTokensChange={setMaxTokens}
+                  onThinkingChange={setThinkingIntensity}
+                  onClose={() => setShowSettings(false)}
+                />
+              )}
+            </div>
+            <button className="toolbar-btn" title="系统提示词" onClick={() => setShowPromptEditor(true)}>
+              <FileText size={16} />
+              {customSystemPrompt && <span className="toolbar-dot" />}
+            </button>
+          </div>
+
+          {showPromptEditor && (
+            <SystemPromptEditor
+              agentName={agentName}
+              systemPrompt={customSystemPrompt || ''}
+              onSave={(name, prompt) => {
+                setAgentName(name)
+                setCustomSystemPrompt(prompt || null)
+              }}
+              onClose={() => setShowPromptEditor(false)}
+            />
+          )}
         </div>
       </main>
     </div>
